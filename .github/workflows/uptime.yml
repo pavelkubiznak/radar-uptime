@@ -1,0 +1,80 @@
+name: Radar uptime
+
+# Externí hlídač dostupnosti https://radar.sintera.cz.
+# Běží na infrastruktuře GitHubu (NE na našem serveru) — proto zachytí i výpadek,
+# kdy server běží, ale zvenku je nedostupný (přesně ten případ z 10denního výpadku).
+
+on:
+  schedule:
+    - cron: '3,18,33,48 * * * *'   # ~každých 15 min (mimo přetíženou :00; GitHub může spustit se zpožděním)
+    - cron: '17 6 * * *'           # denní heartbeat (drží repo aktivní, GitHub jinak cron po 60 dnech nečinnosti vypne)
+  workflow_dispatch:                # ruční spuštění (tlačítko Run workflow)
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Zkontroluj radar.sintera.cz
+        run: |
+          URL="https://radar.sintera.cz/login"
+          for i in 1 2 3; do
+            code=$(curl -s -o /tmp/body -m 20 -w "%{http_code}" "$URL" || echo 000)
+            if [ "$code" = "200" ] && grep -qi "sintera" /tmp/body; then
+              echo "Pokus $i: OK (HTTP 200, přihlašovací stránka radaru se načetla)."
+              echo "Radar běží."
+              exit 0
+            fi
+            echo "Pokus $i selhal (HTTP $code) — za 30 s zkusím znovu (ať to není jen chvilkový výkyv)…"
+            sleep 30
+          done
+          echo "::error::Radar https://radar.sintera.cz NEODPOVÍDÁ — 3 pokusy během ~1 min selhaly. Zkontroluj server / ufw / Caddy."
+          exit 1
+
+      - name: Pošli varovný e-mail (volitelné — jen když jsou nastavené secrets)
+        if: failure()
+        env:
+          MAIL_TO: ${{ secrets.ALERT_MAIL_TO }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+        run: |
+          if [ -z "$SMTP_USER" ] || [ -z "$MAIL_TO" ]; then
+            echo "SMTP secrets nenastaveny — spoléhám na vestavěný e-mail GitHubu o selhání workflow."
+            exit 0
+          fi
+          python3 - <<'PY'
+          import os, smtplib, ssl
+          from email.message import EmailMessage
+          m = EmailMessage()
+          m["From"] = os.environ["SMTP_USER"]
+          m["To"] = os.environ["MAIL_TO"]
+          m["Subject"] = "⚠️ Radar sintera.cz je NEDOSTUPNÝ"
+          m.set_content(
+              "Kontrola https://radar.sintera.cz/login selhala 3x po sobe.\n\n"
+              "Zkontroluj:\n"
+              "- bezi server?  ssh root@178.104.207.97\n"
+              "- ufw status  (port 443 / Caddy)\n"
+              "- docker ps | grep caddy\n"
+              "- systemctl status sintera-radar\n"
+          )
+          with smtplib.SMTP("smtp.gmail.com", 587) as s:
+              s.starttls(context=ssl.create_default_context())
+              s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
+              s.send_message(m)
+          print("Alert e-mail odeslan na", os.environ["MAIL_TO"])
+          PY
+
+  keepalive:
+    if: github.event.schedule == '17 6 * * *'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Heartbeat commit (drží repo aktivní proti 60denní deaktivaci)
+        run: |
+          date -u '+%Y-%m-%d %H:%M UTC' > HEARTBEAT.txt
+          git config user.name "radar-uptime bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add HEARTBEAT.txt
+          git diff --staged --quiet || git commit -m "heartbeat $(date -u +%F)"
+          git push
